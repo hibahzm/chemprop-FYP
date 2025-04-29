@@ -513,8 +513,10 @@ def main(args: Namespace):
 
     args = update_args_with_config(args, best_config)
 
-    args = TrainSubcommand.parser.parse_known_args(namespace=args)[0]
-    save_config(TrainSubcommand.parser, args, best_config_save_path)
+    train_parser = ArgumentParser()
+    train_parser = TrainSubcommand.add_args(train_parser)
+    args = train_parser.parse_known_args(namespace=args)[0]
+    save_config(train_parser, args, best_config_save_path)
 
     logger.info(
         f"Best hyperparameter configuration checkpoint saved to '{best_checkpoint_save_path}'"

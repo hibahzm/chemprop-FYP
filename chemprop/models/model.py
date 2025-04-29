@@ -18,52 +18,102 @@ logger = logging.getLogger(__name__)
 
 BatchType: TypeAlias = TrainingBatch | MulticomponentTrainingBatch
 
-
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 class CrossAttention(nn.Module):
-    def __init__(self, feature_dim, descriptor_dim, hidden_dim, num_heads,dropout):
+    def __init__(self, feature_dim, descriptor_dim, hidden_dim, num_heads, dropout):
         super(CrossAttention, self).__init__()
         self.feature_dim = feature_dim
         self.descriptor_dim = descriptor_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.dropout=dropout
-        # Linear projections to shared hidden space
+        self.dropout = dropout
+        
+        # Linear projections
         self.q_proj = nn.Linear(feature_dim, hidden_dim)
         self.k_proj = nn.Linear(descriptor_dim, hidden_dim)
         self.v_proj = nn.Linear(descriptor_dim, hidden_dim)
-
-        self.dropout = nn.Dropout(dropout)
+        
+        self.dropout_layer = nn.Dropout(dropout)
         self.layernorm = nn.LayerNorm(hidden_dim)
-
-        # Multi-head attention
-        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads, dropout=dropout,batch_first=True)
-        # Optional feedforward layer
+        
+        # Multi-head attention with batch support
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim, 
+            num_heads=num_heads, 
+            dropout=dropout,
+            batch_first=True
+        )
+        
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-
-    def forward(self, V_features, X_descriptor):
+    
+    def forward(self, node_features, descriptor, mask=None):
         """
-        V_features: Tensor of shape (N, d_feat)  # features like bonds
-        X_descriptor: Tensor of shape (1, d_desc)  # single global descriptor
-        Returns: updated V_features of shape (N, hidden_dim)
+        Parameters:
+        -----------
+        node_features: Tensor of shape (batch_size, max_nodes, d_feat)
+        descriptor: Tensor of shape (batch_size, d_desc)
+        mask: Boolean tensor of shape (batch_size, max_nodes) - True for valid nodes, False for padding
+        
+        Returns:
+        --------
+        Tensor of shape (batch_size, max_nodes, d_feat)
         """
-        # Project into Q, K, V 
-        Q = self.q_proj(V_features).unsqueeze(0)  # (1, N, hidden_dim)
-        K = self.k_proj(X_descriptor).unsqueeze(0)  # (1, 1, hidden_dim)
-        V = self.v_proj(X_descriptor).unsqueeze(0)  # (1, 1, hidden_dim)
-
+        # Ensure all inputs are on the same device as the module's parameters
+        device = self.q_proj.weight.device
+        node_features = node_features.to(device)
+        descriptor = descriptor.to(device)
+        if mask is not None:
+            mask = mask.to(device)
+        
+        batch_size, max_nodes, _ = node_features.shape
+        # Project inputs
+        Q = self.q_proj(node_features)  # (batch_size, max_nodes, hidden_dim)
+        K = self.k_proj(descriptor).unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        V = self.v_proj(descriptor).unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        
+        K = K.expand(-1, max_nodes, -1)  # (batch_size, max_nodes, hidden_dim)
+        V = V.expand(-1, max_nodes, -1)  # (batch_size, max_nodes, hidden_dim)
+        # Create attention mask for padding
+        # IMPORTANT: For PyTorch's MultiheadAttention, in key_padding_mask:
+        # - True means position should be IGNORED (masked out)
+        # - False means position should be ATTENDED TO
+        key_padding_mask = None
+        if mask is not None:
+            # We need to invert our mask since our convention is:
+            # - True: valid node
+            # - False: padding
+            # But PyTorch expects:
+            # - True: ignore this position (padding)
+            # - False: attend to this position (valid)
+            key_padding_mask = ~mask  # Shape: (batch_size, max_nodes)
+        
         # Apply multi-head attention
-        attn_output, _ = self.attn(Q, K, V)  # (1, N, hidden_dim)
-        attn_output = self.layernorm(attn_output + Q)
-
-        # Residual + output projection (optional)
-        out = self.out_proj(attn_output.squeeze(0))  # (N, hidden_dim)
-        return out
-
-
+        # key_padding_mask applies to the query sequence in our case
+        attn_output, _ = self.attn(
+            query=Q,
+            key=K, 
+            value=V,
+            key_padding_mask=key_padding_mask  # This mask applies to Q (node features)
+        )
+        
+        # Apply layer norm with residual connection
+        # Note: We don't need to manually apply the mask here because the attention
+        # operation has already handled it correctly
+        output = self.layernorm(Q + attn_output)
+        
+        # Final projection
+        output = self.out_proj(output)
+        
+        # Ensure padding positions are still zero
+        if mask is not None:
+            # Expand mask to match output dimensions
+            expanded_mask = mask.unsqueeze(-1).expand(-1, -1, output.size(-1))
+            # Zero out padding positions
+            output = output * expanded_mask.float()
+        
+        return output
+    
 class MPNN(pl.LightningModule):
     r"""An :class:`MPNN` is a sequence of message passing layers, an aggregation routine, and a
     predictor routine.
@@ -131,7 +181,13 @@ class MPNN(pl.LightningModule):
                 "predictor": predictor.hparams,
             }
         )
-        self._node_cross_attn = None
+        self._node_cross_attn = CrossAttention(
+                    feature_dim=message_passing.output_dim,
+                    descriptor_dim=200,
+                    hidden_dim=message_passing.output_dim,
+                    num_heads=4,
+                    dropout=0.2
+                )
 
         self.message_passing = message_passing
         self.agg = agg
@@ -167,23 +223,6 @@ class MPNN(pl.LightningModule):
     def criterion(self) -> ChempropMetric:
         return self.predictor.criterion
 
-
-    def _init_cross_attention(self, X: Tensor, X_d: Tensor):
-        """Initialize cross attention layers if they don't exist"""
-        if self._node_cross_attn is None:
-            N, d_feat = X.shape
-            print(d_feat)
-            d_desc = X_d.shape[1]
-            
-            self._node_cross_attn = CrossAttention(
-                feature_dim=d_feat,
-                descriptor_dim=d_desc,
-                hidden_dim=d_feat,
-                num_heads=8,
-                dropout=0.2
-            )
-            
-
     def fingerprint(
         self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None
     ) -> Tensor:
@@ -191,12 +230,95 @@ class MPNN(pl.LightningModule):
        
         H_v = self.message_passing(bmg, V_d) 
         if X_d is not None:
-            self._init_cross_attention(H_v, X_d)
-            H_a = self.node_cross_attn(H_v, X_d)
-        H = self.agg(H_a, bmg.batch)
+            
+            # Convert to padded batch format (b, nmax, d)
+            padded_H_v, mask, node_counts = self._to_padded_batch(H_v, bmg.batch)
+            # Apply cross attention on padded batch
+            padded_output = self._node_cross_attn(padded_H_v, X_d, mask)
+            
+            # Convert back to original format (sum_nodes, d)
+            H_v = self._from_padded_batch(padded_output, node_counts)
+        
+        # Now aggregate as before
+        H = self.agg(H_v, bmg.batch)
         H = self.bn(H)
+        
+        return H
 
-        return H 
+    def _to_padded_batch(self, node_features, batch_indices):
+        """
+        Convert node features from (sum_nodes, d_feat) to (batch_size, max_nodes, d_feat)
+        
+        Parameters:
+        -----------
+        node_features: Tensor of shape (sum_nodes, d_feat)
+        batch_indices: Tensor of shape (sum_nodes,) indicating batch membership
+        
+        Returns:
+        --------
+        padded_features: Tensor of shape (batch_size, max_nodes, d_feat)
+        attention_mask: Boolean tensor (batch_size, max_nodes) - True for valid nodes
+        node_counts: List of node counts per batch
+        """
+        device = node_features.device
+        batch_size = batch_indices.max().item() + 1
+        feat_dim = node_features.shape[1]
+        
+        # Count nodes per graph
+        node_counts = []
+        for i in range(batch_size):
+            node_counts.append((batch_indices == i).sum().item())
+        
+        # Find maximum number of nodes in any graph
+        max_nodes = max(node_counts)
+        
+        # Create padded tensor and mask
+        padded_features = torch.zeros(batch_size, max_nodes, feat_dim, device=device)
+        attention_mask = torch.zeros(batch_size, max_nodes, dtype=torch.bool, device=device)
+        
+        # Fill in the padded tensor
+        start_idx = 0
+        for batch_idx, count in enumerate(node_counts):
+            if count > 0:  # Only if there are nodes in this batch
+                end_idx = start_idx + count
+                padded_features[batch_idx, :count] = node_features[start_idx:end_idx]
+                attention_mask[batch_idx, :count] = True
+                start_idx = end_idx
+        
+        return padded_features, attention_mask, node_counts
+
+    def _from_padded_batch(self, padded_features, node_counts):
+        """
+        Convert back from (batch_size, max_nodes, d_feat) to (sum_nodes, d_feat)
+        
+        Parameters:
+        -----------
+        padded_features: Tensor of shape (batch_size, max_nodes, d_feat)
+        node_counts: List of node counts per batch
+        
+        Returns:
+        --------
+        Tensor of shape (sum_nodes, d_feat)
+        """
+        batch_size, _, feat_dim = padded_features.shape
+        device = padded_features.device
+        
+        # Calculate total number of nodes
+        total_nodes = sum(node_counts)
+        
+        # Create output tensor
+        output_features = torch.zeros(total_nodes, feat_dim, device=device)
+        
+        # Fill in the output tensor
+        start_idx = 0
+        for batch_idx, count in enumerate(node_counts):
+            if count > 0:  # Only if there are nodes in this batch
+                end_idx = start_idx + count
+                output_features[start_idx:end_idx] = padded_features[batch_idx, :count]
+                start_idx = end_idx
+        
+        return output_features
+
 
     def encoding(
         self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None, i: int = -1
