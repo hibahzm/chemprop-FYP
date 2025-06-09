@@ -177,9 +177,24 @@ class MoleculeDataset(_MolGraphDatasetMixin, MolGraphDataset):
     def __getitem__(self, idx: int) -> Datum:
         d = self.data[idx]
         mg = self.mg_cache[idx]
+        mg_with_mol = MolGraph(
+                V=mg.V,
+                E=mg.E,
+                edge_index=mg.edge_index,
+                rev_edge_index=mg.rev_edge_index,
+                mol=d.mol  # Assign mol 
+            )
 
-        return Datum(mg, self.V_ds[idx], self.X_d[idx], self.Y[idx], d.weight, d.lt_mask, d.gt_mask)
-
+        return Datum(
+                mg=mg_with_mol,  # Use the updated MolGraph
+                V_d=self.V_ds[idx],
+                x_d=self.X_d[idx],
+                y=self.Y[idx],
+                weight=d.weight,
+                lt_mask=d.lt_mask,
+                gt_mask=d.gt_mask,
+            )
+    
     @property
     def cache(self) -> bool:
         return self.__cache

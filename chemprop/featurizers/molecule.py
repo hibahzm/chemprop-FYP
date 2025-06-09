@@ -92,7 +92,7 @@ class V1RDKit2DFeaturizer(V1RDKit2DFeaturizerMixin):
 @MoleculeFeaturizerRegistry("v1_rdkit_2d_normalized")
 class V1RDKit2DNormalizedFeaturizer(V1RDKit2DFeaturizerMixin):
     def __init__(self):
-        self.generator = rdNormalizedDescriptors.RDKit2DNormalized()
+        self.generator = rdNormalizedDescriptors.RDKit2DHistogramNormalized()
 
 
 @MoleculeFeaturizerRegistry("charge")
