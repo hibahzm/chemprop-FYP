@@ -30,6 +30,7 @@ class BatchMolGraph:
     reverse edge in the ``edge_index`` attribute."""
     batch: Tensor = field(init=False)
     """the index of the parent :class:`MolGraph` in the batched graph"""
+    names: list[str] = field(init=False)  # Add SMILES strings for the batch
 
     __size: int = field(init=False)
 
@@ -41,6 +42,7 @@ class BatchMolGraph:
         edge_indexes = []
         rev_edge_indexes = []
         batch_indexes = []
+        self.names = [] 
 
         num_nodes = 0
         num_edges = 0
@@ -50,7 +52,8 @@ class BatchMolGraph:
             edge_indexes.append(mg.edge_index + num_nodes)
             rev_edge_indexes.append(mg.rev_edge_index + num_edges)
             batch_indexes.append([i] * len(mg.V))
-
+            self.names.append(mg.name)
+            
             num_nodes += mg.V.shape[0]
             num_edges += mg.edge_index.shape[1]
 

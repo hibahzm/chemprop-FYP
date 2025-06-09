@@ -18,49 +18,100 @@ logger = logging.getLogger(__name__)
 
 BatchType: TypeAlias = TrainingBatch | MulticomponentTrainingBatch
 
+import pandas as pd
+from transformers import RobertaTokenizer, RobertaModel
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+
+class ChemBERTaEncoder(nn.Module):
+    def __init__(self, model_name="DeepChem/ChemBERTa-77M-MLM", fine_tune_percent=10, unfreeze_pooler=True):
+        super().__init__()
+        self.tokenizer = RobertaTokenizer.from_pretrained(model_name)
+        self.encoder = RobertaModel.from_pretrained(model_name)
+
+        # Step 1: Freeze all parameters
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+        # Step 2: Unfreeze the top k layers based on fine_tune_percent
+        num_layers_total = len(self.encoder.encoder.layer)
+        k = max(1, int(num_layers_total * fine_tune_percent / 100))
+
+        for layer in self.encoder.encoder.layer[-k:]:  # Unfreeze top k layers
+            for param in layer.parameters():
+                param.requires_grad = True
+
+        # Logging
+        total = sum(p.numel() for p in self.encoder.parameters())
+        trainable = sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+        print(f"ChemBERTa Total parameters: {total}")
+        print(f"Trainable parameters: {trainable} ({100 * trainable / total:.2f}%)")
+
+    def encode(self, smiles_list: list[str], batch_size=64, max_length=128):
+        device = next(self.encoder.parameters()).device
+        all_hidden_states = []
+        all_pooler_outputs = []
+
+        for i in range(0, len(smiles_list), batch_size):
+            batch = smiles_list[i:i+batch_size]
+            inputs = self.tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=max_length)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.set_grad_enabled(self.encoder.training):
+                outputs = self.encoder(**inputs)
+                last_hidden = outputs.last_hidden_state.detach().clone()     # [B, L, d_model]
+                pooler = outputs.pooler_output.detach().clone()              # [B, d_model]
+                all_hidden_states.append(last_hidden)
+                all_pooler_outputs.append(pooler)
+
+        # Return both as tensors
+        return {
+            "last_hidden_state": torch.cat(all_hidden_states, dim=0),
+            "pooler_output": torch.cat(all_pooler_outputs, dim=0)
+        }
+
+class fusionGAT(nn.Module):
+    def __init__(self, dmpnn_dim: int, bert_dim: int, hidden_dim: int):
+        super().__init__()
+        # Project descriptor and nodes to hidden_dim
+        self.W_dmpnn = nn.Linear(dmpnn_dim, hidden_dim)
+        self.W_bert = nn.Linear(bert_dim, hidden_dim)
+        self.attn_fc = nn.Linear(2 * hidden_dim, 1)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        
+    def forward(self, dmpnn_output: Tensor, encodings: Tensor) -> Tensor:
+        """
+        desc: (B, dmpnn_dim)
+        nodes: (B, L, bert_dim)
+        
+        Returns:
+            updated_desc: (B, hidden_dim)
+        """
+        B, L, _ = encodings.size()
+
+        dmpnn_proj = self.W_dmpnn(dmpnn_output)  # (B, hidden_dim)
+        bert_proj = self.W_bert(encodings)  # (B, L, hidden_dim)
+
+        # Expand dmpnn_proj to (B, L, hidden_dim) to concatenate with each node
+        dmpnn_expanded = dmpnn_proj.unsqueeze(1).expand(-1, L, -1)  # (B, L, hidden_dim)
+
+        # Concatenate dmpnn and bert features
+        cat = torch.cat([dmpnn_expanded, bert_proj], dim=-1)  # (B, L, 2*hidden_dim)
+
+        # Compute attention scores
+        e = self.leaky_relu(self.attn_fc(cat)).squeeze(-1)  # (B, L)
+
+        # Attention weights over L nodes
+        alpha = torch.softmax(e, dim=1).unsqueeze(-1)  # (B, L, 1)
+
+        # Weighted sum of node features
+        fusion = torch.sum(alpha * bert_proj, dim=1)  # (B, hidden_dim)
+
+        return fusion
+
+
 
 class MPNN(pl.LightningModule):
-    r"""An :class:`MPNN` is a sequence of message passing layers, an aggregation routine, and a
-    predictor routine.
-
-    The first two modules calculate learned fingerprints from an input molecule
-    reaction graph, and the final module takes these learned fingerprints as input to calculate a
-    final prediction. I.e., the following operation:
-
-    .. math::
-        \mathtt{MPNN}(\mathcal{G}) =
-            \mathtt{predictor}(\mathtt{agg}(\mathtt{message\_passing}(\mathcal{G})))
-
-    The full model is trained end-to-end.
-
-    Parameters
-    ----------
-    message_passing : MessagePassing
-        the message passing block to use to calculate learned fingerprints
-    agg : Aggregation
-        the aggregation operation to use during molecule-level predictor
-    predictor : Predictor
-        the function to use to calculate the final prediction
-    batch_norm : bool, default=False
-        if `True`, apply batch normalization to the output of the aggregation operation
-    metrics : Iterable[Metric] | None, default=None
-        the metrics to use to evaluate the model during training and evaluation
-    warmup_epochs : int, default=2
-        the number of epochs to use for the learning rate warmup
-    init_lr : int, default=1e-4
-        the initial learning rate
-    max_lr : float, default=1e-3
-        the maximum learning rate
-    final_lr : float, default=1e-4
-        the final learning rate
-
-    Raises
-    ------
-    ValueError
-        if the output dimension of the message passing block does not match the input dimension of
-        the predictor function
-    """
-
     def __init__(
         self,
         message_passing: MessagePassing,
@@ -73,25 +124,28 @@ class MPNN(pl.LightningModule):
         max_lr: float = 1e-3,
         final_lr: float = 1e-4,
         X_d_transform: ScaleTransform | None = None,
+        fine_tune_bert: bool = True,
+        fine_tune_percent: int = 10
     ):
         super().__init__()
-        # manually add X_d_transform to hparams to suppress lightning's warning about double saving
-        # its state_dict values.
         self.save_hyperparameters(ignore=["X_d_transform", "message_passing", "agg", "predictor"])
         self.hparams["X_d_transform"] = X_d_transform
-        self.hparams.update(
-            {
-                "message_passing": message_passing.hparams,
-                "agg": agg.hparams,
-                "predictor": predictor.hparams,
-            }
+        self.hparams.update({
+            "message_passing": message_passing.hparams,
+            "agg": agg.hparams,
+            "predictor": predictor.hparams,
+        })
+        
+        self.fusion_GAT = fusionGAT(
+            dmpnn_dim=message_passing.output_dim,
+            bert_dim=768,
+            hidden_dim=message_passing.output_dim
         )
-
+        
         self.message_passing = message_passing
         self.agg = agg
         self.bn = nn.BatchNorm1d(self.message_passing.output_dim) if batch_norm else nn.Identity()
         self.predictor = predictor
-
         self.X_d_transform = X_d_transform if X_d_transform is not None else nn.Identity()
 
         self.metrics = (
@@ -104,6 +158,18 @@ class MPNN(pl.LightningModule):
         self.init_lr = init_lr
         self.max_lr = max_lr
         self.final_lr = final_lr
+        
+        self.fine_tune_bert = fine_tune_bert
+        self.fine_tune_percent = fine_tune_percent
+        
+        
+        self.bert_encoder = ChemBERTaEncoder(
+            model_name="seyonec/ChemBERTa-zinc-base-v1",
+            fine_tune_percent=self.fine_tune_percent if self.fine_tune_bert else 0
+        )
+
+        self.bert_encoder = self.bert_encoder.to(self.device)
+        
 
     @property
     def output_dim(self) -> int:
@@ -121,26 +187,23 @@ class MPNN(pl.LightningModule):
     def criterion(self) -> ChempropMetric:
         return self.predictor.criterion
 
-    def fingerprint(
-        self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None
-    ) -> Tensor:
-        """the learned fingerprints for the input molecules"""
+    def fingerprint(self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None) -> Tensor:
         H_v = self.message_passing(bmg, V_d)
         H = self.agg(H_v, bmg.batch)
-        H = self.bn(H)
+        
+        smiles_list = bmg.names
+        outputs = self.bert_encoder.encode(smiles_list)
+        output_pooler = outputs["last_hidden_state"]
+        
+        fingerprint = self.fusion_GAT(H, output_pooler)
+        fingerprint = self.bn(fingerprint)
+        
+        return fingerprint if X_d is None else torch.cat((fingerprint, self.X_d_transform(X_d)), 1)
 
-        return H if X_d is None else torch.cat((H, self.X_d_transform(X_d)), 1)
-
-    def encoding(
-        self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None, i: int = -1
-    ) -> Tensor:
-        """Calculate the :attr:`i`-th hidden representation"""
+    def encoding(self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None, i: int = -1) -> Tensor:
         return self.predictor.encode(self.fingerprint(bmg, V_d, X_d), i)
 
-    def forward(
-        self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None
-    ) -> Tensor:
-        """Generate predictions for the input molecules/reactions"""
+    def forward(self, bmg: BatchMolGraph, V_d: Tensor | None = None, X_d: Tensor | None = None) -> Tensor:
         return self.predictor(self.fingerprint(bmg, V_d, X_d))
 
     def training_step(self, batch: BatchType, batch_idx):
@@ -155,7 +218,6 @@ class MPNN(pl.LightningModule):
         l = self.criterion(preds, targets, mask, weights, lt_mask, gt_mask)
 
         self.log("train_loss", self.criterion, batch_size=batch_size, prog_bar=True, on_epoch=True)
-
         return l
 
     def on_validation_model_eval(self) -> None:
@@ -164,6 +226,9 @@ class MPNN(pl.LightningModule):
         self.message_passing.graph_transform.train()
         self.X_d_transform.train()
         self.predictor.output_transform.train()
+        
+        if self.fine_tune_bert:
+            self.bert_encoder.encoder.train()
 
     def validation_step(self, batch: BatchType, batch_idx: int = 0):
         self._evaluate_batch(batch, "val")
@@ -199,35 +264,12 @@ class MPNN(pl.LightningModule):
             self.log(f"{label}/{m.alias}", m, batch_size=batch_size)
 
     def predict_step(self, batch: BatchType, batch_idx: int, dataloader_idx: int = 0) -> Tensor:
-        """Return the predictions of the input batch
-
-        Parameters
-        ----------
-        batch : TrainingBatch
-            the input batch
-
-        Returns
-        -------
-        Tensor
-            a tensor of varying shape depending on the task type:
-
-            * regression/binary classification: ``n x (t * s)``, where ``n`` is the number of input
-              molecules/reactions, ``t`` is the number of tasks, and ``s`` is the number of targets
-              per task. The final dimension is flattened, so that the targets for each task are
-              grouped. I.e., the first ``t`` elements are the first target for each task, the second
-              ``t`` elements the second target, etc.
-
-            * multiclass classification: ``n x t x c``, where ``c`` is the number of classes
-        """
         bmg, X_vd, X_d, *_ = batch
-
         return self(bmg, X_vd, X_d)
 
     def configure_optimizers(self):
         opt = optim.Adam(self.parameters(), self.init_lr)
         if self.trainer.train_dataloader is None:
-            # Loading `train_dataloader` to estimate number of training batches.
-            # Using this line of code can pypass the issue of using `num_training_batches` as described [here](https://github.com/Lightning-AI/pytorch-lightning/issues/16060).
             self.trainer.estimated_stepping_batches
         steps_per_epoch = self.trainer.num_training_batches
         warmup_steps = self.warmup_epochs * steps_per_epoch
@@ -244,9 +286,7 @@ class MPNN(pl.LightningModule):
             opt, warmup_steps, cooldown_steps, self.init_lr, self.max_lr, self.final_lr
         )
 
-        lr_sched_config = {"scheduler": lr_sched, "interval": "step"}
-
-        return {"optimizer": opt, "lr_scheduler": lr_sched_config}
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": lr_sched, "interval": "step"}}
 
     def get_batch_size(self, batch: TrainingBatch) -> int:
         return len(batch[0])
