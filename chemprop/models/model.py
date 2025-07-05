@@ -78,7 +78,7 @@ class fusionGAT(nn.Module):
         self.W_bert = nn.Linear(bert_dim, hidden_dim)
         self.attn_fc = nn.Linear(2 * hidden_dim, 1)
         self.leaky_relu = nn.LeakyReLU(0.2)
-        
+        self.W_out=nn.Linear(2*hidden_dim, hidden_dim)
     def forward(self, dmpnn_output: Tensor, encodings: Tensor) -> Tensor:
         """
         desc: (B, dmpnn_dim)
@@ -105,8 +105,10 @@ class fusionGAT(nn.Module):
         alpha = torch.softmax(e, dim=1).unsqueeze(-1)  # (B, L, 1)
 
         # Weighted sum of node features
-        fusion = torch.sum(alpha * bert_proj, dim=1)  # (B, hidden_dim)
+        weighted = torch.sum(alpha * bert_proj, dim=1)   # (B, hidden_dim)
 
+        concat = torch.cat([dmpnn_proj, weighted], dim=-1)  # (B, 2*hidden_dim)
+        fusion = self.W_out(concat)                         # (B, hidden_dim)
         return fusion
 
 
